@@ -1,0 +1,102 @@
+# Release pipeline.
+#
+# A tag push is the only trigger: tagging is the deliberate act that publishes
+# a version. The Gitee mirror forwards tags to GitHub, so tagging on Gitee is
+# enough — no separate step here.
+#
+# What a release contains: the frontend bundles are rebuilt from the tagged
+# source (so the artifact can never ship a stale dist/mismatched build), and
+# the archive is built from an explicit file list rather than the whole
+# checkout, so dev-only paths (js/src, js/node_modules, tests, .github) stay
+# out of what users download.
+name: Release
+
+on:
+  push:
+    # Every tag. Narrow to 'v*' if you also push tags that are not releases.
+    tags:
+      - '*'
+
+# gh release create needs to write the release; nothing else is required.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The tag is the single source of truth for the version; js/package.json
+      # carries the same number so the repository does not advertise two of
+      # them. This check is what keeps the two in step: forgetting to bump the
+      # file fails the release right here — before any dependency install or
+      # build work is spent, and before a release is published — instead of
+      # leaving the mismatch to be noticed by whoever next reads the file.
+      #
+      # It is also why the version is bumped as part of preparing a tag rather
+      # than after: the tag has to be pushed to run this at all.
+      #
+      # A tag may carry the conventional `v` prefix (`v1.0.13`) while the file
+      # holds a bare semver — a version string cannot start with a `v`, so the
+      # two could never be compared literally. Only the tag is normalised here;
+      # the file goes on holding a valid version, which is the whole point of
+      # keeping the two in step.
+      - name: Check the package version against the tag
+        run: |
+          VERSION=$(node -p "require('./js/package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::js/package.json declares version $VERSION but the tag is ${GITHUB_REF_NAME} (version ${TAG}). Bump js/package.json to ${TAG} before tagging."
+            exit 1
+          fi
+
+          echo "js/package.json matches the tag (${GITHUB_REF_NAME} → ${TAG})."
+
+      # --frozen-lockfile: the committed js/yarn.lock is what gets installed,
+      # so two runs of this job (and a local build) resolve byte-identical
+      # dependency trees. Without it a fresh resolve could pull a new
+      # transitive release into the build and change — or break — an artifact
+      # that is supposed to depend only on the tag.
+      #
+      # The flag also fails the job when js/package.json and js/yarn.lock
+      # disagree, which is the reminder to commit a regenerated lock file
+      # whenever a dependency is added.
+      - name: Build the frontend bundles
+        working-directory: js
+        run: |
+          yarn install --frozen-lockfile --network-timeout 600000
+          yarn build
+
+      # Explicit list: this is the set of files the extension needs at runtime
+      # (js/dist, not js/src). composer.lock is intentionally left out —
+      # Composer ignores a dependency's lock file.
+      - name: Package the extension
+        run: |
+          zip -r "waterfall-${GITHUB_REF_NAME}.zip" \
+            src \
+            js/dist \
+            less \
+            locale \
+            migrations \
+            extend.php \
+            composer.json \
+            README.md \
+            LICENSE
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "waterfall-${GITHUB_REF_NAME}.zip"

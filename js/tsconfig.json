@@ -1,0 +1,39 @@
+{
+  // Use Flarum's tsconfig as a starting point.
+  "extends": "flarum-tsconfig",
+  // This will match all .ts, .tsx, .d.ts, .js, .jsx files in your `src`
+  // folder and also tells your TypeScript server to read core's global
+  // typings for access to `dayjs` and `$` in the global namespace.
+  //
+  // Core's typings are looked up through the extension's own Composer tree
+  // first, then through the site's. The first entry is what a plain clone (CI)
+  // can satisfy — `composer install` puts core in the repository's `vendor/` —
+  // and the second is the working copy under a site's `vendor/lcoy/waterfall`.
+  // TypeScript ignores an include pattern that matches nothing, so the
+  // irrelevant one is harmless.
+  "include": ["src/**/*", "tests/**/*", "../vendor/flarum/core/js/dist-typings/@types/**/*", "../../../flarum/core/js/dist-typings/@types/**/*", "@types/**/*"],
+  "compilerOptions": {
+    // Load only the global typings this project actually uses. Without this,
+    // tsc pulls in every package under node_modules/@types — including the
+    // transitive @types/node, whose newest releases use syntax the pinned
+    // TypeScript cannot parse. Those parse errors are not suppressed by
+    // skipLibCheck (it only covers type errors, not syntax) and buried the
+    // real output of `check-typings` under ~50 unrelated failures. The
+    // frontend talks to the browser, not to Node, so jest is all that is
+    // needed; add a name here if a global from another @types package is
+    // ever relied upon.
+    "types": ["jest"],
+    // This will output typings to `dist-typings`.
+    "declarationDir": "./dist-typings",
+    // The webpack build is transpile-only, so nothing else would fail on an
+    // unused import or a leftover parameter. These two keep the editor (and a
+    // manual `tsc --noEmit`) honest instead.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "paths": {
+      // Same two layouts as `include` above; the first match wins.
+      "flarum/*": ["../vendor/flarum/core/js/dist-typings/*", "../../../flarum/core/js/dist-typings/*"]
+    },
+    "baseUrl": "."
+  }
+}
