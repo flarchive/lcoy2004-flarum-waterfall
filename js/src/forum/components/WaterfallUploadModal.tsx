@@ -1,0 +1,869 @@
+import app from 'flarum/forum/app';
+import Modal from 'flarum/common/components/Modal';
+import Button from 'flarum/common/components/Button';
+import type { AlertAttrs } from 'flarum/common/components/Alert';
+import classList from 'flarum/common/utils/classList';
+import extractText from 'flarum/common/utils/extractText';
+import type { IInternalModalAttrs } from 'flarum/common/components/Modal';
+
+import type WaterfallSet from '../../common/models/WaterfallSet';
+import { decodeImage, encodeThumbnail } from '../../common/imageThumbnail';
+import { capacityExhaustedMessage, capacityWaitDelay, sendImageUpload, UPLOAD_CAPACITY_MAX_WAITS } from '../../common/imageUpload';
+import { MAX_TAGS, MAX_TAG_LENGTH, splitTagDraft } from '../../common/tags';
+import { acceptListForWhitelist } from '../../common/uploadWhitelist';
+import type WaterfallState from '../states/WaterfallState';
+
+type QueueStatus = 'ready' | 'uploading' | 'done' | 'error';
+
+/**
+ * Read once per page: the admin setting cannot change without a reload.
+ * Empty (a hand-cleared setting) means the picker falls back to every image
+ * type; the server still rejects what is not whitelisted.
+ */
+let acceptTypes: string | null = null;
+
+function acceptAttribute(): string {
+  return (acceptTypes ??= acceptListForWhitelist(app.forum.attribute<string | undefined>('waterfallMimeWhitelist') || ''));
+}
+
+interface QueueItem {
+  // Stable identity across re-renders and drag reordering (the array index
+  // changes when items are dragged or removed).
+  key: string;
+  file: File;
+  title: string;
+  // Intrinsic size, pre-read locally for the queue label only.
+  width: number | null;
+  height: number | null;
+  // Card-sized copy encoded in the browser (see common/imageThumbnail): the
+  // feed renders `thumb ?? src`, so without one every card would download the
+  // full-size original. Null when the file gains nothing from a copy (small,
+  // GIF, or the encoder is unavailable).
+  thumb: Blob | null;
+  progress: number;
+  status: QueueStatus;
+  error: string | null;
+  xhr: XMLHttpRequest | null;
+  // Set when the user cancels an in-flight upload: the sequential upload
+  // chain must not immediately pick this item up again.
+  cancelled: boolean;
+  // Set while the item is between attempts because the server had no capacity
+  // left for it (see uploadItem): the row says so instead of showing a
+  // progress figure that is not moving.
+  waitingForCapacity?: boolean;
+}
+
+export interface WaterfallUploadModalAttrs extends IInternalModalAttrs {
+  // The modal manager reserves the `state` key for its own ModalManagerState,
+  // so the waterfall feed state travels under a dedicated attribute.
+  waterfallState: WaterfallState;
+}
+
+/**
+ * Upload dialog: click-to-choose, drag & drop, multi-file queue, drag-to-reorder
+ * of the queue (the order becomes the set's display order), per-file and
+ * overall progress (XHR upload events), retry on failure and cancel.
+ *
+ * One upload session is one image set: the set is created first (with the
+ * optional title), then every file is sent with its `set_id` and `position`.
+ * The files go to the API endpoint which stages them and answers with a
+ * `pending` resource; the queue worker then transfers them to the image host.
+ */
+export default class WaterfallUploadModal<CustomAttrs extends WaterfallUploadModalAttrs = WaterfallUploadModalAttrs> extends Modal<CustomAttrs> {
+  protected queue: QueueItem[] = [];
+  protected dragging = false;
+  protected submitting = false;
+
+  // Title of the set created on submit (empty = untitled).
+  protected setTitle = '';
+  // Freeform tags the user writes for the set (chips input). Normalised
+  // client-side (trim / length / dedupe) and again server-side.
+  protected tags: string[] = [];
+  protected tagDraft = '';
+  // The set created for this upload session, and whether it has been inserted
+  // into the feed yet (done on the first successful file).
+  protected set: WaterfallSet | null = null;
+  protected setAdded = false;
+
+  // Drag-to-reorder bookkeeping (keys, not indices: indices shift while
+  // dragging).
+  protected dragKey: string | null = null;
+  protected dragOverKey: string | null = null;
+
+  /**
+   * In-flight `prepareItem` runs, awaited by submit() so an upload can never
+   * start before the queued files have their card copies. They never reject.
+   */
+  protected preparing: Promise<void>[] = [];
+
+  /**
+   * How many files may be decoded and encoded at once.
+   *
+   * Each preparation decodes a full-size image into an ImageBitmap and paints
+   * it through a canvas — tens of megabytes of pixels for a modern phone
+   * photo. Firing one per dropped file meant a batch of thirty started thirty
+   * decodes in the same tick, which blocks the main thread and can exhaust
+   * memory on a mid-range phone. Three keeps the queue moving without that
+   * spike.
+   */
+  protected static readonly PREPARE_CONCURRENCY = 3;
+
+  protected activePrepares = 0;
+  protected waitingPrepares: (() => void)[] = [];
+
+  protected keySeq = 0;
+
+  className() {
+    return 'WaterfallUploadModal Modal--large';
+  }
+
+  title() {
+    return app.translator.trans('lcoy-waterfall.forum.upload_modal.title');
+  }
+
+  content() {
+    const total = this.queue.length;
+    const done = this.queue.filter((item) => item.status === 'done' || item.status === 'error').length;
+    const allDone = total > 0 && this.queue.every((item) => item.status === 'done' || item.status === 'error');
+    const hasErrors = this.queue.some((item) => item.status === 'error');
+    const overall = total > 0 ? Math.round(this.queue.reduce((sum, item) => sum + item.progress, 0) / total) : 0;
+
+    return (
+      <div className="Modal-body WaterfallUploadModal-body">
+        <p className="WaterfallUploadModal-description">{app.translator.trans('lcoy-waterfall.forum.upload_modal.description')}</p>
+
+        <div className="WaterfallUploadModal-setTitle">
+          <label className="WaterfallUploadModal-setTitleLabel" for="waterfall-set-title">
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.set_title_label')}
+          </label>
+          <input
+            id="waterfall-set-title"
+            type="text"
+            className="FormControl"
+            value={this.setTitle}
+            maxlength={200}
+            disabled={this.submitting}
+            placeholder={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.set_title_placeholder'))}
+            oninput={(e: InputEvent) => {
+              this.setTitle = (e.target as HTMLInputElement).value;
+            }}
+          />
+          <p className="WaterfallUploadModal-setTitleHint">{app.translator.trans('lcoy-waterfall.forum.upload_modal.set_title_hint')}</p>
+        </div>
+
+        <div className="WaterfallUploadModal-tags">
+          <label className="WaterfallUploadModal-setTitleLabel" for="waterfall-set-tags">
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.tags_label')}
+          </label>
+
+          <div className="WaterfallUploadModal-tagsField" onclick={() => this.focusTagInput()}>
+            {this.tags.map((tag) => (
+              <span className="WaterfallUploadModal-tag" key={tag}>
+                {tag}
+                <button
+                  type="button"
+                  className="WaterfallUploadModal-tagRemove"
+                  aria-label={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.tag_remove', { tag }))}
+                  disabled={this.submitting}
+                  onclick={() => {
+                    this.tags = this.tags.filter((existing) => existing !== tag);
+                  }}
+                >
+                  <i className="fas fa-times" aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+
+            {this.tags.length < MAX_TAGS && (
+              <input
+                id="waterfall-set-tags"
+                type="text"
+                className="WaterfallUploadModal-tagInput"
+                value={this.tagDraft}
+                disabled={this.submitting}
+                placeholder={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.tags_placeholder'))}
+                oninput={(e: InputEvent) => {
+                  const input = e.target as HTMLInputElement;
+
+                  // A comma always separates tags — including the ones that
+                  // arrive by paste, which the old keydown-only handler turned
+                  // into a single over-long tag. A paste is a finished list, so
+                  // its last segment counts too; while typing, whatever follows
+                  // the last comma stays in the field.
+                  this.commitTagDraft(input.value, (e.inputType ?? '').startsWith('insertFromPaste'));
+                }}
+                onkeydown={(e: KeyboardEvent) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    this.commitTagDraft(this.tagDraft, true);
+                  } else if (e.key === 'Backspace' && this.tagDraft === '') {
+                    this.tags = this.tags.slice(0, -1);
+                  }
+                }}
+                onblur={() => this.commitTagDraft(this.tagDraft, true)}
+              />
+            )}
+          </div>
+
+          <p className="WaterfallUploadModal-setTitleHint">
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.tags_hint', {
+              count: MAX_TAGS,
+              length: MAX_TAG_LENGTH,
+            })}
+          </p>
+        </div>
+
+        <div
+          className={classList('WaterfallUploadModal-dropzone', { 'WaterfallUploadModal-dropzone--dragging': this.dragging })}
+          ondragover={(e: DragEvent) => {
+            e.preventDefault();
+
+            // A queue item being reordered is not a new file drop.
+            if (this.dragKey) {
+              return;
+            }
+
+            this.dragging = true;
+          }}
+          ondragleave={() => {
+            this.dragging = false;
+          }}
+          ondrop={(e: DragEvent) => {
+            e.preventDefault();
+            this.dragging = false;
+
+            if (this.dragKey) {
+              this.dragKey = null;
+              this.dragOverKey = null;
+
+              return;
+            }
+
+            this.addFiles(e.dataTransfer?.files);
+          }}
+        >
+          <i className="fas fa-cloud-upload-alt" aria-hidden="true" />
+          <p>{app.translator.trans('lcoy-waterfall.forum.upload_modal.drop_here')}</p>
+          <Button className="Button Button--primary" disabled={this.submitting} onclick={() => this.pickFiles()}>
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.choose_files')}
+          </Button>
+          <input
+            type="file"
+            className="WaterfallUploadModal-fileInput"
+            accept={acceptAttribute()}
+            disabled={this.submitting}
+            multiple
+            onchange={(e: Event) => {
+              const input = e.target as HTMLInputElement;
+              this.addFiles(input.files);
+              input.value = '';
+            }}
+          />
+        </div>
+
+        {this.queue.length > 0 && (
+          <div className="WaterfallUploadModal-queue" role="list">
+            {this.queue.map((item) => (
+              <div
+                key={item.key}
+                className={classList(
+                  'WaterfallUploadModal-item',
+                  `WaterfallUploadModal-item--${item.status}`,
+                  { 'WaterfallUploadModal-item--dragging': this.dragKey === item.key },
+                  { 'WaterfallUploadModal-item--over': this.dragOverKey === item.key }
+                )}
+                role="listitem"
+                draggable={item.status === 'ready' ? 'true' : 'false'}
+                ondragstart={(e: DragEvent) => {
+                  this.dragKey = item.key;
+                  this.dragOverKey = null;
+                  e.dataTransfer?.setData('text/plain', item.key);
+
+                  if (e.dataTransfer) {
+                    e.dataTransfer.effectAllowed = 'move';
+                  }
+                }}
+                ondragover={(e: DragEvent) => {
+                  if (!this.dragKey || item.status !== 'ready' || this.dragKey === item.key) {
+                    return;
+                  }
+
+                  e.preventDefault();
+                  this.dragOverKey = item.key;
+
+                  if (e.dataTransfer) {
+                    e.dataTransfer.dropEffect = 'move';
+                  }
+                }}
+                ondragleave={() => {
+                  if (this.dragOverKey === item.key) {
+                    this.dragOverKey = null;
+                  }
+                }}
+                ondrop={(e: DragEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  this.reorder(this.dragKey, item.key);
+                  this.dragKey = null;
+                  this.dragOverKey = null;
+                }}
+                ondragend={() => {
+                  this.dragKey = null;
+                  this.dragOverKey = null;
+                }}
+              >
+                {item.status === 'ready' && (
+                  <div className="WaterfallUploadModal-itemHandle" aria-hidden="true">
+                    <i className="fas fa-grip-vertical" />
+                  </div>
+                )}
+
+                <div className="WaterfallUploadModal-itemIcon">
+                  <i className="fas fa-file-image" aria-hidden="true" />
+                </div>
+                <div className="WaterfallUploadModal-itemBody">
+                  <div className="WaterfallUploadModal-itemName" title={item.file.name}>
+                    {item.file.name}
+                  </div>
+                  <div className="WaterfallUploadModal-itemMeta">
+                    {item.status === 'ready' && item.width && item.height && (
+                      <span>
+                        {item.width}×{item.height}
+                      </span>
+                    )}
+                    {item.status === 'uploading' && !item.waitingForCapacity && <span>{item.progress}%</span>}
+                    {item.status === 'uploading' && item.waitingForCapacity && (
+                      <span>{app.translator.trans('lcoy-waterfall.forum.upload_modal.waiting_capacity')}</span>
+                    )}
+                    {item.status === 'done' && (
+                      <span className="WaterfallUploadModal-itemDone">
+                        <i className="fas fa-check" aria-hidden="true" />
+                      </span>
+                    )}
+                    {item.status === 'error' && <span className="WaterfallUploadModal-itemError">{item.error}</span>}
+                  </div>
+                  {(item.status === 'uploading' || item.status === 'done') && !item.waitingForCapacity && (
+                    <div className="WaterfallUploadModal-progress">
+                      <div className="WaterfallUploadModal-progressBar" style={{ width: `${item.progress}%` }} />
+                    </div>
+                  )}
+                </div>
+                <div className="WaterfallUploadModal-itemActions">
+                  {item.status === 'error' && (
+                    <Button
+                      className="Button Button--icon"
+                      icon="fas fa-redo"
+                      aria-label={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.retry'))}
+                      onclick={() => this.retryItem(item)}
+                    />
+                  )}
+                  {item.status === 'uploading' ? (
+                    <Button
+                      className="Button Button--icon"
+                      icon="fas fa-times"
+                      aria-label={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.cancel'))}
+                      onclick={() => this.cancelItem(item)}
+                    />
+                  ) : (
+                    <Button
+                      className="Button Button--icon"
+                      icon="fas fa-trash-alt"
+                      aria-label={extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.remove'))}
+                      onclick={() => {
+                        this.queue = this.queue.filter((existing) => existing !== item);
+
+                        if (this.dragKey === item.key) {
+                          this.dragKey = null;
+                        }
+
+                        if (this.dragOverKey === item.key) {
+                          this.dragOverKey = null;
+                        }
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {total > 0 && (
+          <div className="WaterfallUploadModal-overall">
+            <span className="WaterfallUploadModal-overallLabel">
+              {this.submitting
+                ? app.translator.trans('lcoy-waterfall.forum.upload_modal.uploading', { done, total })
+                : app.translator.trans('lcoy-waterfall.forum.upload_modal.overall_progress')}
+            </span>
+            <div className="WaterfallUploadModal-progress WaterfallUploadModal-progress--overall">
+              <div className="WaterfallUploadModal-progressBar" style={{ width: `${overall}%` }} />
+            </div>
+          </div>
+        )}
+
+        {allDone && (
+          <div className={classList('WaterfallUploadModal-notice', { 'WaterfallUploadModal-notice--error': hasErrors })}>
+            {hasErrors
+              ? app.translator.trans('lcoy-waterfall.forum.upload_modal.failed_hint')
+              : app.translator.trans('lcoy-waterfall.forum.upload_modal.finished')}
+          </div>
+        )}
+
+        <div className="WaterfallUploadModal-actions">
+          <Button
+            className="Button Button--primary"
+            loading={this.submitting}
+            disabled={!this.queue.some((item) => item.status === 'ready')}
+            onclick={() => this.submit()}
+          >
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.submit')}
+          </Button>
+          <Button className="Button" onclick={() => this.hide()}>
+            {app.translator.trans('lcoy-waterfall.forum.upload_modal.close')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  protected pickFiles(): void {
+    (this.element?.querySelector('.WaterfallUploadModal-fileInput') as HTMLInputElement | null)?.click();
+  }
+
+  /**
+   * Commit the tags held in `raw`; see splitTagDraft for the splitting rules.
+   */
+  protected commitTagDraft(raw: string = this.tagDraft, commitTail = false): void {
+    const { tags, draft } = splitTagDraft(raw, this.tags, commitTail);
+
+    this.tags = tags;
+    this.tagDraft = draft;
+  }
+
+  protected focusTagInput(): void {
+    (this.element?.querySelector('.WaterfallUploadModal-tagInput') as HTMLInputElement | null)?.focus();
+  }
+
+  protected addFiles(fileList: FileList | null | undefined): void {
+    // A run in progress has already taken its snapshot of the preparation
+    // promises below, so a file arriving now would be queued and picked up by
+    // uploadQueue() while its own preparation is still in flight — the card
+    // copy would be missing and the feed would download the full-size
+    // original. Refusing it is also what the picker's disabled state says.
+    if (!fileList || this.submitting) {
+      return;
+    }
+
+    for (const file of Array.from(fileList)) {
+      if (!file.type.startsWith('image/')) {
+        continue;
+      }
+
+      const item: QueueItem = {
+        key: `wf-${this.keySeq++}`,
+        file,
+        title: file.name.replace(/\.[^.]+$/, ''),
+        width: null,
+        height: null,
+        thumb: null,
+        progress: 0,
+        status: 'ready',
+        error: null,
+        xhr: null,
+        cancelled: false,
+      };
+
+      this.queue.push(item);
+      this.preparing.push(this.prepareWithLimit(item));
+    }
+  }
+
+  /**
+   * Move the dragged item to the drop target's position. The queue order is
+   * the display order sent as each file's `position`.
+   */
+  protected reorder(fromKey: string | null, toKey: string): void {
+    if (!fromKey || fromKey === toKey) {
+      return;
+    }
+
+    const from = this.queue.findIndex((item) => item.key === fromKey);
+    const to = this.queue.findIndex((item) => item.key === toKey);
+
+    if (from === -1 || to === -1) {
+      return;
+    }
+
+    const [moved] = this.queue.splice(from, 1);
+
+    this.queue.splice(to, 0, moved);
+    m.redraw();
+  }
+
+  /**
+   * Prepare one file, respecting the concurrency budget.
+   *
+   * The wait is a promise rather than a queue of work: the item is already in
+   * `this.queue` (so it is visible and reorderable while it waits), and only
+   * the expensive decode is held back.
+   */
+  protected async prepareWithLimit(item: QueueItem): Promise<void> {
+    await this.acquirePrepareSlot();
+
+    try {
+      await this.prepareItem(item);
+    } finally {
+      this.releasePrepareSlot();
+    }
+  }
+
+  protected acquirePrepareSlot(): Promise<void> {
+    if (this.activePrepares < WaterfallUploadModal.PREPARE_CONCURRENCY) {
+      this.activePrepares++;
+
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      this.waitingPrepares.push(() => {
+        this.activePrepares++;
+        resolve();
+      });
+    });
+  }
+
+  protected releasePrepareSlot(): void {
+    this.activePrepares--;
+    this.waitingPrepares.shift()?.();
+  }
+
+  /**
+   * Decode a queued file once and read everything the queue needs from the
+   * decode: the intrinsic size for the label, and the card-sized copy (both
+   * in common/imageThumbnail). Runs in the background while the user arranges
+   * the queue; submit() waits for it.
+   *
+   * Never rejects — a file that will not decode here will fail server-side
+   * validation anyway, and an item without a copy is still uploadable.
+   */
+  protected async prepareItem(item: QueueItem): Promise<void> {
+    let source: ImageBitmap | HTMLImageElement | undefined;
+
+    try {
+      source = await decodeImage(item.file);
+
+      item.width = source.width;
+      item.height = source.height;
+      item.thumb = await encodeThumbnail(source, item.file);
+    } catch {
+      // A file that will not decode here will fail server-side validation
+      // anyway; leaving the label off is enough.
+    } finally {
+      // An ImageBitmap pins decoded pixels (GPU memory included) until it is
+      // closed, so the release lives in a finally: a failed encode must not
+      // leak the whole batch's bitmaps.
+      if (source && 'close' in source) {
+        source.close();
+      }
+    }
+
+    m.redraw();
+  }
+
+  /**
+   * Create the set, then upload every queued file into it in queue order.
+   */
+  protected submit(): void {
+    if (this.submitting) {
+      return;
+    }
+
+    this.submitting = true;
+
+    // An explicit submit re-arms items the user cancelled earlier: they are
+    // back in the `ready` state, so leaving the flag set would make the button
+    // do nothing for them. Cancels issued during this run still take effect,
+    // because cancelItem() sets the flag while the chain is running.
+    this.queue.forEach((item) => {
+      if (item.status === 'ready') {
+        item.cancelled = false;
+      }
+    });
+
+    // A tag typed into the field but never confirmed — no Enter, no blur yet —
+    // still belongs to the set being published.
+    this.commitTagDraft(this.tagDraft, true);
+
+    const title = this.setTitle.replace(/\s+/gu, ' ').trim();
+
+    // Decoding and re-encoding a batch of photos takes a moment, and the
+    // upload button is live from the instant the first file lands in the
+    // queue. Waiting for the in-flight work here is what makes the card copy
+    // deterministic instead of a race the user can lose by clicking quickly.
+    // These promises never reject (prepareItem swallows its own failures).
+    Promise.all(this.preparing)
+      .then(() =>
+        app.store
+          .createRecord<WaterfallSet>('waterfall-sets')
+          .save({ title: title === '' ? null : title, tags: this.tags.length > 0 ? this.tags : null })
+      )
+      .then((set) => {
+        this.set = set;
+        this.setAdded = false;
+
+        return this.uploadQueue();
+      })
+      .then(() => this.finishSubmit())
+      .catch((error: unknown) => {
+        this.submitting = false;
+
+        const alert = (error as { alert?: AlertAttrs | null } | null)?.alert;
+
+        if (alert) {
+          app.alerts.show(alert, alert.content);
+        } else {
+          app.alerts.show({ type: 'error' }, extractText(app.translator.trans('lcoy-waterfall.forum.upload_modal.set_failed')));
+        }
+
+        m.redraw();
+      });
+  }
+
+  /**
+   * Sequential upload keeps per-user concurrency within limits. Cancelled items
+   * are skipped: the user explicitly stopped them, so re-uploading the same
+   * item right after its abort would defeat the cancel.
+   */
+  protected uploadQueue(): Promise<void> {
+    const uploadNext = (): Promise<void> => {
+      const next = this.queue.find((item) => item.status === 'ready' && !item.cancelled);
+
+      if (!next) {
+        return Promise.resolve();
+      }
+
+      return this.uploadItem(next).then(uploadNext).catch(uploadNext);
+    };
+
+    return uploadNext();
+  }
+
+  /**
+   * Wrap up a submit run. If not a single file made it (all failed or were
+   * cancelled), delete the freshly created empty set again instead of leaving
+   * a phantom card in the feed.
+   */
+  protected finishSubmit(): void {
+    this.submitting = false;
+
+    const set = this.set;
+
+    if (set && !this.queue.some((item) => item.status === 'done')) {
+      const state = this.attrs.waterfallState;
+
+      this.set = null;
+      this.setAdded = false;
+
+      // Model.delete() removes the set from the store as part of the request;
+      // only the feed array this page owns has to be told separately.
+      set
+        .delete()
+        .then(() => {
+          state?.removeSet(set);
+        })
+        .catch(() => {})
+        .then(() => m.redraw());
+
+      return;
+    }
+
+    m.redraw();
+  }
+
+  /**
+   * Retry a failed item. A retry is a submit run like any other, so it must
+   * enter through the same single serial path: two retries clicked in a row
+   * would otherwise fire two parallel XHRs (breaking the per-user concurrency
+   * limit the sequential queue exists to respect) while `submitting` stayed
+   * false — leaving the progress bar, the disabled fields and the submit
+   * button all lying, the last of which could create a second set behind the
+   * user's back.
+   */
+  protected retryItem(item: QueueItem): void {
+    // Single-flight with submit(): while a run owns the queue, a retry click
+    // is ignored instead of starting a second one alongside it.
+    if (this.submitting) {
+      return;
+    }
+
+    item.cancelled = false;
+    item.status = 'ready';
+
+    // Reuse the current set when it survived (some file succeeded); otherwise
+    // a fresh set is created by submit().
+    if (!this.set || !this.setAdded) {
+      this.submit();
+
+      return;
+    }
+
+    const set = this.set;
+    const state = this.attrs.waterfallState;
+
+    this.submitting = true;
+    m.redraw();
+
+    this.uploadQueue()
+      .then(() => {
+        // A retried image can push the set back to `pending`, so hand it to
+        // the feed again: addUploadedSet() restarts the pending poll, which is
+        // what makes the transferred image appear without a page reload.
+        if (item.status === 'done') {
+          state?.addUploadedSet(set);
+        }
+      })
+      .catch(() => {})
+      .then(() => {
+        // uploadItem() resolves on load/error/abort, and uploadQueue() swallows
+        // anything else, so this always runs and `submitting` cannot stick.
+        this.submitting = false;
+        m.redraw();
+      });
+  }
+
+  /**
+   * Transfer one item, waiting out the uploader's own capacity when the server
+   * says it is full.
+   *
+   * A batch upload races the per-user concurrency limit: the modal sends the
+   * next file as soon as the previous request returns, while the transfers
+   * behind it are still running, so the fourth or fifth file can arrive while
+   * the maximum number of images is in flight. That is a temporary condition
+   * rather than a failure, and the wait belongs here — inside the promise the
+   * serial chain awaits — so the next file still cannot start until this one
+   * has settled, and nothing has to be retried by hand.
+   */
+  protected async uploadItem(item: QueueItem): Promise<void> {
+    const set = this.set;
+
+    if (!set) {
+      return;
+    }
+
+    for (let attempt = 0; ; attempt++) {
+      const outcome = await this.sendItem(item, set);
+
+      if (outcome !== 'capacity') {
+        return;
+      }
+
+      if (attempt >= UPLOAD_CAPACITY_MAX_WAITS) {
+        // Out of patience: the file was never transferred, and leaving it on
+        // 'uploading' would hide that — the row would sit at 0% forever, the
+        // run would never report itself finished, and the one thing the user
+        // could do about it (retry) would never be offered.
+        item.waitingForCapacity = false;
+        item.status = 'error';
+        item.progress = 0;
+        item.error = capacityExhaustedMessage();
+        m.redraw();
+
+        return;
+      }
+
+      item.waitingForCapacity = true;
+      m.redraw();
+
+      await new Promise((resolve) => setTimeout(resolve, capacityWaitDelay(attempt)));
+
+      item.waitingForCapacity = false;
+
+      // A cancel during the wait already put the item back to 'ready'.
+      if (item.cancelled) {
+        return;
+      }
+    }
+  }
+
+  /**
+   * One attempt at sending an item, resolving with what came of it: 'done',
+   * 'capacity' (the server refused for no reason other than this uploader's
+   * own in-flight images), 'failed', or 'aborted'.
+   *
+   * The XHR mechanics live in sendImageUpload (common/imageUpload); this
+   * method only maps the outcome onto the queue item and the feed.
+   */
+  protected sendItem(item: QueueItem, set: WaterfallSet): Promise<'done' | 'capacity' | 'failed' | 'aborted'> {
+    return sendImageUpload(item, this.queue.indexOf(item), String(set.id()), {
+      // The handle is not cleared here: afterSettle does that on every
+      // outcome, and clearing it after onXhr had set it would leave
+      // cancelItem() with nothing to abort. See the ordering note in
+      // sendImageUpload.
+      beforeStart: () => {
+        item.status = 'uploading';
+        item.progress = 0;
+        item.error = null;
+        item.waitingForCapacity = false;
+      },
+      onXhr: (xhr) => {
+        item.xhr = xhr;
+      },
+      onProgress: (progress) => {
+        item.progress = progress;
+        m.redraw();
+      },
+      afterSettle: () => {
+        item.xhr = null;
+      },
+    }).then((result) => {
+      if (result.outcome === 'done') {
+        item.status = 'done';
+        item.progress = 100;
+
+        const state = this.attrs.waterfallState;
+
+        // Add the set to the feed once, on the first successful file; it is
+        // then polled until the worker finishes the transfers.
+        if (state && !this.setAdded) {
+          this.setAdded = true;
+          state.addUploadedSet(set);
+        }
+
+        m.redraw();
+
+        return 'done' as const;
+      }
+
+      if (result.outcome === 'capacity') {
+        // Left on 'uploading': the caller is about to wait and send again.
+        m.redraw();
+
+        return 'capacity' as const;
+      }
+
+      if (result.outcome === 'failed') {
+        item.status = 'error';
+        item.progress = 0;
+        // Every failure path carries a message: the server's own detail for a
+        // refused upload, the translated network error when it never answered.
+        item.error = result.errorDetail;
+        m.redraw();
+
+        return 'failed' as const;
+      }
+
+      return 'aborted' as const;
+    });
+  }
+
+  protected cancelItem(item: QueueItem): void {
+    item.xhr?.abort();
+    item.xhr = null;
+    // abort() resolves the request synchronously, but the chain that continues
+    // from it runs a microtask later — so the flag is set here, while this call
+    // is still on the stack, and uploadQueue finds it set and skips the item.
+    item.cancelled = true;
+    item.status = 'ready';
+    item.progress = 0;
+  }
+}
